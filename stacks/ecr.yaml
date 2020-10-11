@@ -1,0 +1,10 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ECR repositories for ECS Autoscaling Services
+
+Resources:
+  SqsConsumer:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: ecs-autoscaling/sqs-consumer
+      Tags:
+        - { Key: Name, Value: ecs-autoscaling/sqs-consumer }

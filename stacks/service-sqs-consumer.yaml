@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Autoscaling SQS Consumer Service in AWS Fargate
+
+Parameters:
+  Deployment:
+    Type: String
+
+Resources:
+
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-queue'
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-queue' }
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      RoleName: !Sub ${AWS::StackName}-task-role
+      Path: /
+      Policies:
+      - PolicyName: AgentManagementPolicy
+        PolicyDocument:
+          Statement:
+          - Sid: SQSAccess
+            Effect: Allow
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+            Resource: !GetAtt Queue.Arn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-taskdef
+      ContainerDefinitions:
+        - Name: sqs-consumer
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ecs-autoscaling/sqs-consumer
+          Environment:
+              - { Name: QUEUE_URL, Value: !Ref Queue }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: sqs-consumer
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub ${Deployment}-ecs-TaskExecutionRoleArn
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-taskdef' }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+      LogGroupName: !Sub ${AWS::StackName}
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${AWS::StackName}-sg
+      GroupDescription: !Sub Security group for ${AWS::StackName} service
+      VpcId: !ImportValue infra-vpc-VpcId
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-sg' }
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue: !Sub ${Deployment}-ecs-Cluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 75
+      DesiredCount: 0
+      EnableECSManagedTags: true
+      CapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1, Base: 1 } # 20 % after base
+        - { CapacityProvider: FARGATE_SPOT, Weight: 4 } # 80 % after base
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - Fn::ImportValue: infra-vpc-sn-public-a
+            - Fn::ImportValue: infra-vpc-sn-public-b
+          SecurityGroups:
+            - !Ref SecurityGroup
+      PropagateTags: SERVICE
+      TaskDefinition: !Ref TaskDefinition
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-service' }
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 0
+      MaxCapacity: 8
+      ResourceId:
+        Fn::Sub:
+          - service/${Cluster}/${Service.Name}
+          - Cluster:
+              Fn::ImportValue: !Sub ${Deployment}-ecs-Cluster
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
+
+  # Target tracking to scale up / down by load
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-sp-cpu
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 80
+        ScaleInCooldown: 60
+        ScaleOutCooldown: 60
+
+  # Step scaling to scale to / from zero.
+
+  QueueEmptyAndIdleAlarm2:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmActions:
+        # Queue is idle --> scale to 0.
+        - !Ref ScalingPolicyToZero
+      OKActions:
+        # Queue has messages --> scale to 1 (target tracking scale-out rule may take precedence over this).
+        - !Ref ScalingPolicyFromZero
+      AlarmDescription: Alarm if queue is empty and idle
+      AlarmName: !Sub ${AWS::StackName}-alarm-QueueEmptyAndIdle2
+      ComparisonOperator: LessThanThreshold
+      Threshold: 1
+      EvaluationPeriods: 15
+      Metrics:
+      - Id: e1
+        Expression: FILL(m1, 0) + FILL(m2, 0) + FILL(m3, 0) + FILL(m4, 0)
+        ReturnData: true
+      - Id: m1
+        MetricStat:
+          Metric:
+            Namespace: AWS/SQS
+            Dimensions:
+              - { Name: QueueName, Value: !GetAtt Queue.QueueName }
+            MetricName: NumberOfMessagesReceived
+          Period: 60
+          Stat: Sum
+        ReturnData: false
+      - Id: m2
+        MetricStat:
+          Metric:
+            Namespace: AWS/SQS
+            Dimensions:
+              - { Name: QueueName, Value: !GetAtt Queue.QueueName }
+            MetricName: NumberOfMessagesSent
+          Period: 60
+          Stat: Sum
+        ReturnData: false
+      - Id: m3
+        MetricStat:
+          Metric:
+            Namespace: AWS/SQS
+            Dimensions:
+              - { Name: QueueName, Value: !GetAtt Queue.QueueName }
+            MetricName: ApproximateNumberOfMessagesNotVisible
+          Period: 60
+          Stat: Maximum
+        ReturnData: false
+      - Id: m4
+        MetricStat:
+          Metric:
+            Namespace: AWS/SQS
+            Dimensions:
+              - { Name: QueueName, Value: !GetAtt Queue.QueueName }
+            MetricName: ApproximateNumberOfMessagesVisible
+          Period: 60
+          Stat: Maximum
+        ReturnData: false
+
+  ScalingPolicyToZero:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-sp-to-zero
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: 0
+
+  ScalingPolicyFromZero:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub ${AWS::StackName}-sp-from-zero
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: 1
+
+Outputs:
+  QueueUrl:
+    Value: !Ref Queue

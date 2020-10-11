@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: ECS infrastructure for running containers in Fargate
+
+Parameters:
+  Deployment:
+    Type: String
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}
+      CapacityProviders:
+          - FARGATE
+          - FARGATE_SPOT
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}' }
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      RoleName: !Sub ${AWS::StackName}-task-execution-role
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub ${Deployment}-ecs-Cluster
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export:
+      Name: !Sub ${Deployment}-ecs-ClusterArn
+
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export:
+      Name: !Sub ${Deployment}-ecs-TaskExecutionRoleArn
